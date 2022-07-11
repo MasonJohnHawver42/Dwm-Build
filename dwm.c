@@ -30,6 +30,7 @@
 #include <unistd.h>
 #include <sys/types.h>
 #include <sys/wait.h>
+#include <sys/epoll.h>
 #include <X11/cursorfont.h>
 #include <X11/keysym.h>
 #include <X11/Xatom.h>
@@ -69,9 +70,21 @@ enum { WMProtocols, WMDelete, WMState, WMTakeFocus, WMLast }; /* default atoms *
 enum { ClkTagBar, ClkLtSymbol, ClkStatusText, ClkWinTitle,
        ClkClientWin, ClkRootWin, ClkLast }; /* clicks */
 
+typedef struct TagState TagState;
+struct TagState {
+	int selected;
+	int occupied;
+	int urgent;
+};
+
+typedef struct ClientState ClientState;
+struct ClientState {
+	int isfixed, isfloating, isurgent, neverfocus, oldstate, isfullscreen;
+};
+
 typedef union {
-	int i;
-	unsigned int ui;
+	long i;
+	unsigned long ui;
 	float f;
 	const void *v;
 } Arg;
@@ -101,6 +114,7 @@ struct Client {
 	Client *snext;
 	Monitor *mon;
 	Window win;
+	ClientState prevstate;
 };
 
 typedef struct {
@@ -115,8 +129,10 @@ typedef struct {
 	void (*arrange)(Monitor *);
 } Layout;
 
+
 struct Monitor {
 	char ltsymbol[16];
+	char lastltsymbol[16];
 	float mfact;
 	int nmaster;
 	int num;
@@ -130,14 +146,17 @@ struct Monitor {
 	unsigned int seltags;
 	unsigned int sellt;
 	unsigned int tagset[2];
+	TagState tagstate;
 	int showbar;
 	int topbar;
 	Client *clients;
 	Client *sel;
+	Client *lastsel;
 	Client *stack;
 	Monitor *next;
 	Window barwin;
 	const Layout *lt[2];
+	const Layout *lastlt;
 	int ltcur; /* current layout */
 };
 
@@ -176,6 +195,7 @@ static void drawbar(Monitor *m);
 static void drawbars(void);
 static void expose(XEvent *e);
 static void focus(Client *c);
+static void focusdir(const Arg *arg);
 static void focusin(XEvent *e);
 static void focusmon(const Arg *arg);
 static void focusstack(const Arg *arg);
@@ -185,6 +205,7 @@ static long getstate(Window w);
 static int gettextprop(Window w, Atom atom, char *text, unsigned int size);
 static void grabbuttons(Client *c, int focused);
 static void grabkeys(void);
+static int handlexevent(struct epoll_event *ev);
 static void incnmaster(const Arg *arg);
 static void keypress(XEvent *e);
 static void killclient(const Arg *arg);
@@ -198,6 +219,7 @@ static void moveorplace(const Arg *arg);
 static Client *nexttiled(Client *c);
 static void placemouse(const Arg *arg);
 static void pop(Client *);
+static void placedir(const Arg *arg);
 static void propertynotify(XEvent *e);
 static void quit(const Arg *arg);
 static Client *recttoclient(int x, int y, int w, int h);
@@ -215,9 +237,11 @@ static void setfocus(Client *c);
 static void setfullscreen(Client *c, int fullscreen);
 static void layoutscroll(const Arg *arg);
 static void setlayout(const Arg *arg);
+static void setlayoutsafe(const Arg *arg);
 static void setcfact(const Arg *arg);
 static void setmfact(const Arg *arg);
 static void setup(void);
+static void setupepoll(void);
 static void seturgent(Client *c, int urg);
 static void showhide(Client *c);
 static void sigchld(int unused);
@@ -278,17 +302,27 @@ static void (*handler[LASTEvent]) (XEvent *) = {
 	[UnmapNotify] = unmapnotify
 };
 static Atom wmatom[WMLast], netatom[NetLast];
+static int epoll_fd;
+static int dpy_fd;
 static int restart = 0;
 static int running = 1;
 static Cur *cursor[CurLast];
 static Clr **scheme;
 static Display *dpy;
 static Drw *drw;
-static Monitor *mons, *selmon;
+static Monitor *mons, *selmon, *lastselmon;
 static Window root, wmcheckwin;
+
+#include "ipc.h"
 
 /* configuration, allows nested code to access above variables */
 #include "config.h"
+
+#ifdef VERSION
+#include "IPCClient.c"
+#include "yajl_dumps.c"
+#include "ipc.c"
+#endif
 
 /* compile-time check if all tags fit into an unsigned int bit array. */
 struct NumTags { char limitexceeded[LENGTH(tags) > 31 ? -1 : 1]; };
@@ -514,6 +548,12 @@ cleanup(void)
 	XSync(dpy, False);
 	XSetInputFocus(dpy, PointerRoot, RevertToPointerRoot, CurrentTime);
 	XDeleteProperty(dpy, root, netatom[NetActiveWindow]);
+
+	ipc_cleanup();
+
+	if (close(epoll_fd) < 0) {
+			fprintf(stderr, "Failed to close epoll file descriptor\n");
+	}
 }
 
 void
@@ -1124,6 +1164,72 @@ focus(Client *c)
 	drawbars();
 }
 
+void
+focusdir(const Arg *arg)
+{
+	Client *s = selmon->sel, *f = NULL, *c, *next;
+
+	if (!s)
+		return;
+
+	unsigned int score = -1;
+	unsigned int client_score;
+	int dist;
+	int dirweight = 20;
+	int isfloating = s->isfloating;
+
+	next = s->next;
+	if (!next)
+		next = s->mon->clients;
+	for (c = next; c != s; c = next) {
+
+		next = c->next;
+		if (!next)
+			next = s->mon->clients;
+
+		if (!ISVISIBLE(c) || c->isfloating != isfloating) // || HIDDEN(c)
+			continue;
+
+		switch (arg->i) {
+		case 0: // left
+			dist = s->x - c->x - c->w;
+			client_score =
+				dirweight * MIN(abs(dist), abs(dist + s->mon->ww)) +
+				abs(s->y - c->y);
+			break;
+		case 1: // right
+			dist = c->x - s->x - s->w;
+			client_score =
+				dirweight * MIN(abs(dist), abs(dist + s->mon->ww)) +
+				abs(c->y - s->y);
+			break;
+		case 2: // up
+			dist = s->y - c->y - c->h;
+			client_score =
+				dirweight * MIN(abs(dist), abs(dist + s->mon->wh)) +
+				abs(s->x - c->x);
+			break;
+		default:
+		case 3: // down
+			dist = c->y - s->y - s->h;
+			client_score =
+				dirweight * MIN(abs(dist), abs(dist + s->mon->wh)) +
+				abs(c->x - s->x);
+			break;
+		}
+
+		if (((arg->i == 0 || arg->i == 2) && client_score <= score) || client_score < score) {
+			score = client_score;
+			f = c;
+		}
+	}
+
+	if (f && f != s) {
+		focus(f);
+		restack(f->mon);
+	}
+}
+
 /* there are some broken focus acquiring clients needing extra handling */
 void
 focusin(XEvent *e)
@@ -1280,6 +1386,25 @@ grabkeys(void)
 					XGrabKey(dpy, code, keys[i].mod | modifiers[j], root,
 						True, GrabModeAsync, GrabModeAsync);
 	}
+}
+
+int
+handlexevent(struct epoll_event *ev)
+{
+	if (ev->events & EPOLLIN) {
+		XEvent ev;
+		while (running && XPending(dpy)) {
+			XNextEvent(dpy, &ev);
+			if (handler[ev.type]) {
+				handler[ev.type](&ev); /* call handler */
+				ipc_send_events(mons, &lastselmon, selmon);
+			}
+		}
+	} else if (ev-> events & EPOLLHUP) {
+		return -1;
+	}
+
+	return 0;
 }
 
 void
@@ -1665,6 +1790,103 @@ placemouse(const Arg *arg)
 }
 
 void
+placedir(const Arg *arg)
+{
+	Client *s = selmon->sel, *f = NULL, *c, *next, *fprior, *sprior;
+
+	if (!s || s->isfloating)
+		return;
+
+	unsigned int score = -1;
+	unsigned int client_score;
+	int dist;
+	int dirweight = 20;
+
+	next = s->next;
+	if (!next)
+		next = s->mon->clients;
+	for (c = next; c != s; c = next) {
+
+		next = c->next;
+		if (!next)
+			next = s->mon->clients;
+
+		if (!ISVISIBLE(c)) // || HIDDEN(c)
+			continue;
+
+		switch (arg->i) {
+		case 0: // left
+			dist = s->x - c->x - c->w;
+			client_score =
+				dirweight * MIN(abs(dist), abs(dist + s->mon->ww)) +
+				abs(s->y - c->y);
+			break;
+		case 1: // right
+			dist = c->x - s->x - s->w;
+			client_score =
+				dirweight * MIN(abs(dist), abs(dist + s->mon->ww)) +
+				abs(c->y - s->y);
+			break;
+		case 2: // up
+			dist = s->y - c->y - c->h;
+			client_score =
+				dirweight * MIN(abs(dist), abs(dist + s->mon->wh)) +
+				abs(s->x - c->x);
+			break;
+		default:
+		case 3: // down
+			dist = c->y - s->y - s->h;
+			client_score =
+				dirweight * MIN(abs(dist), abs(dist + s->mon->wh)) +
+				abs(c->x - s->x);
+			break;
+		}
+
+		if (((arg->i == 0 || arg->i == 2) && client_score <= score) || client_score < score) {
+			score = client_score;
+			f = c;
+		}
+	}
+
+	if (f && f != s) {
+		for (fprior = f->mon->clients; fprior && fprior->next != f; fprior = fprior->next);
+		for (sprior = s->mon->clients; sprior && sprior->next != s; sprior = sprior->next);
+
+		if (s == fprior) {
+			next = f->next;
+			if (sprior)
+				sprior->next = f;
+			else
+				f->mon->clients = f;
+			f->next = s;
+			s->next = next;
+		} else if (f == sprior) {
+			next = s->next;
+			if (fprior)
+				fprior->next = s;
+			else
+				s->mon->clients = s;
+			s->next = f;
+			f->next = next;
+		} else { // clients are not adjacent to each other
+			next = f->next;
+			f->next = s->next;
+			s->next = next;
+			if (fprior)
+				fprior->next = s;
+			else
+				s->mon->clients = s;
+			if (sprior)
+				sprior->next = f;
+			else
+				f->mon->clients = f;
+		}
+
+		arrange(f->mon);
+	}
+}
+
+void
 pop(Client *c)
 {
 	detach(c);
@@ -1857,12 +2079,40 @@ restack(Monitor *m)
 void
 run(void)
 {
-	XEvent ev;
-	/* main event loop */
+	int event_count = 0;
+	const int MAX_EVENTS = 10;
+	struct epoll_event events[MAX_EVENTS];
+
 	XSync(dpy, False);
-	while (running && !XNextEvent(dpy, &ev))
-		if (handler[ev.type])
-			handler[ev.type](&ev); /* call handler */
+
+	/* main event loop */
+	while (running) {
+		event_count = epoll_wait(epoll_fd, events, MAX_EVENTS, -1);
+
+		for (int i = 0; i < event_count; i++) {
+			int event_fd = events[i].data.fd;
+			DEBUG("Got event from fd %d\n", event_fd);
+
+			if (event_fd == dpy_fd) {
+				// -1 means EPOLLHUP
+				if (handlexevent(events + i) == -1)
+					return;
+			} else if (event_fd == ipc_get_sock_fd()) {
+				ipc_handle_socket_epoll_event(events + i);
+			} else if (ipc_is_client_registered(event_fd)){
+				if (ipc_handle_client_epoll_event(events + i, mons, &lastselmon, selmon,
+							tags, LENGTH(tags), layouts, LENGTH(layouts)) < 0) {
+					fprintf(stderr, "Error handling IPC event on fd %d\n", event_fd);
+				}
+			} else {
+				fprintf(stderr, "Got event from unknown fd %d, ptr %p, u32 %d, u64 %lu",
+						event_fd, events[i].data.ptr, events[i].data.u32,
+						events[i].data.u64);
+				fprintf(stderr, " with events %d\n", events[i].events);
+				return;
+			}
+		}
+	}
 }
 
 void
@@ -2041,6 +2291,18 @@ setcfact(const Arg *arg)
 	arrange(selmon);
 }
 
+void
+setlayoutsafe(const Arg *arg)
+{
+	const Layout *ltptr = (Layout *)arg->v;
+	if (ltptr == 0)
+			setlayout(arg);
+	for (int i = 0; i < LENGTH(layouts); i++) {
+		if (ltptr == &layouts[i])
+			setlayout(arg);
+	}
+}
+
 /* arg > 1.0 will set mfact absolutely */
 void
 setmfact(const Arg *arg)
@@ -2130,8 +2392,37 @@ setup(void)
 	grabkeys();
 	focus(NULL);
 	spawnbar();
+	setupepoll();
 }
 
+void
+setupepoll(void)
+{
+	epoll_fd = epoll_create1(0);
+	dpy_fd = ConnectionNumber(dpy);
+	struct epoll_event dpy_event;
+
+	// Initialize struct to 0
+	memset(&dpy_event, 0, sizeof(dpy_event));
+
+	DEBUG("Display socket is fd %d\n", dpy_fd);
+
+	if (epoll_fd == -1) {
+		fputs("Failed to create epoll file descriptor", stderr);
+	}
+
+	dpy_event.events = EPOLLIN;
+	dpy_event.data.fd = dpy_fd;
+	if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, dpy_fd, &dpy_event)) {
+		fputs("Failed to add display file descriptor to epoll", stderr);
+		close(epoll_fd);
+		exit(1);
+	}
+
+	if (ipc_init(ipcsockpath, epoll_fd, ipccommands, LENGTH(ipccommands)) < 0) {
+		fputs("Failed to initialize IPC\n", stderr);
+	}
+}
 
 void
 seturgent(Client *c, int urg)
@@ -2547,10 +2838,18 @@ updatestatus(void)
 void
 updatetitle(Client *c)
 {
+	char oldname[sizeof(c->name)];
+	strcpy(oldname, c->name);
+
 	if (!gettextprop(c->win, netatom[NetWMName], c->name, sizeof c->name))
 		gettextprop(c->win, XA_WM_NAME, c->name, sizeof c->name);
 	if (c->name[0] == '\0') /* hack to mark broken clients */
 		strcpy(c->name, broken);
+
+	for (Monitor *m = mons; m; m = m->next) {
+		if (m->sel == c && strcmp(oldname, c->name) != 0)
+			ipc_focused_title_change_event(m->num, c->win, oldname, c->name);
+	}
 }
 
 void
